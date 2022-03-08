@@ -31,7 +31,7 @@ from torchdynamo.optimizations.inference import fixed_strategy1
 from torchdynamo.optimizations.inference import fixed_strategy2
 from torchdynamo.optimizations.inference import offline_autotuner
 from torchdynamo.optimizations.inference import online_autotuner
-from torchdynamo.optimizations.training import aot_autograd_debug_strategy1
+from torchdynamo.optimizations.training import aot_autograd_debug_strategy2
 from torchdynamo.optimizations.training import aot_autograd_speedup_strategy
 from torchdynamo.profiler import Profiler
 from torchdynamo.profiler import fx_insert_profiling
@@ -633,7 +633,7 @@ def main():
         output_filename = "baseline_trt.csv"
     elif args.accuracy_aot_nop:
         optimize_ctx = torchdynamo.optimize(
-            aot_autograd_debug_strategy1, nopython=args.nopython
+            aot_autograd_debug_strategy2, nopython=args.nopython
         )
         experiment = speedup_experiment
         output_filename = "accuracy_aot_nop.csv"

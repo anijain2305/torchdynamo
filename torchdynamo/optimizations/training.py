@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 
@@ -10,7 +11,6 @@ from .backends import BACKENDS
 from .normalize import normalize_ir
 
 log = logging.getLogger(__name__)
-
 
 class AOTAutogradStrategy(object):
     """Base class for backend strategies that use AOT Autograd"""
@@ -73,6 +73,10 @@ class AOTAutogradEagerSaveStrategy(AOTAutogradEagerStrategy):
 
     def candidate(self):
         global graph_idx
+        save_graph_num = int(os.environ["DYNAMO_SAVE_GRAPH"])
+        if graph_idx != save_graph_num:
+            graph_idx += 1
+            return self.gm
         module_idx = "module_" + str(graph_idx)
         self.gm.to_folder(module_idx, "Bar")
         for idx, x in enumerate(self.example_inputs):
