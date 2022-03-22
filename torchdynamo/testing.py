@@ -83,7 +83,8 @@ def same(a, b):
         return True
     elif isinstance(a, torch.Tensor):
         assert isinstance(b, torch.Tensor)
-        return torch.allclose(a, b, atol=1e-4, rtol=1e-4)
+        tol = 1e-3
+        return torch.allclose(a, b, atol=tol, rtol=tol)
     elif isinstance(a, (str, int, float, type(None), bool, torch.device)):
         return a == b
     elif type(a).__name__ in (

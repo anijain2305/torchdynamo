@@ -32,6 +32,7 @@ from torchdynamo.optimizations.inference import fixed_strategy2
 from torchdynamo.optimizations.inference import offline_autotuner
 from torchdynamo.optimizations.inference import online_autotuner
 from torchdynamo.optimizations.training import aot_autograd_debug_strategy1
+from torchdynamo.optimizations.training import aot_autograd_nnc_strategy
 from torchdynamo.optimizations.training import aot_autograd_speedup_strategy
 from torchdynamo.profiler import Profiler
 from torchdynamo.profiler import fx_insert_profiling
@@ -41,6 +42,7 @@ from torchdynamo.testing import format_speedup
 from torchdynamo.testing import reduce_to_scalar_loss
 from torchdynamo.testing import same
 from torchdynamo.utils import clone_inputs
+from torchdynamo.utils import counters
 
 os.environ["KALDI_ROOT"] = "/tmp"  # avoids some spam
 torchbench_dir = abspath(
@@ -63,15 +65,24 @@ SKIP_TRAIN = {
     # not designed for training
     "pyhpc_equation_of_state",
     "pyhpc_isoneutral_mixing",
+
     # Unusual training setup
     "opacus_cifar10",
     "maml",
+
     # Known issues with training
     "demucs",  # https://github.com/pytorch/benchmark/pull/639
     "densenet121",  # https://github.com/pytorch/benchmark/issues/652
     "hf_Albert",  # https://github.com/pytorch/benchmark/issues/652
+    "hf_Reformer", # Can only be used in the training phase
+
     # AOT Autograd known issues
     "dlrm",  # No sparse support
+    "resnet50_quantized_qat", # Con2DBnRelu
+
+    # Known TorchDynamo bug
+    "hf_GPT2", # Hard to debug stashed tensor issue
+    "tacotron2", # Model uses Variable
 }
 
 # Some models have bad train dataset. We read eval dataset.
@@ -175,14 +186,18 @@ class Stats:
         for k, v in sorted(cls.totals.items()):
             lines = "\n  ".join(map(str, v.most_common(50)))
             print(f"STATS {k}\n  {lines}")
+    
+    @classmethod
+    def aot_summary(cls):
+        return [cls.totals['aot_autograd']['total'], cls.totals['aot_autograd']['ok']]
+ 
 
-
-def output_csv(headers, row):
-    assert output_filename
-    existed = os.path.exists(output_filename)
+def output_csv(filename, headers, row):
+    assert filename
+    existed = os.path.exists(filename)
     output = csv.writer(
         io.TextIOWrapper(
-            open(output_filename, "ab", buffering=0),
+            open(filename, "ab", buffering=0),
             "utf-8",
             write_through=True,
         ),
@@ -206,6 +221,7 @@ def coverage_experiment(args, model_iter_fn, model, example_inputs):
         model_iter_fn(model, example_inputs)
     coverage_result = profiler.results()
     output_csv(
+        output_filename,
         (
             "dev",
             "name",
@@ -223,6 +239,39 @@ def coverage_experiment(args, model_iter_fn, model, example_inputs):
         + coverage_result.tocsv(),
     )
     return coverage_result
+
+
+def get_cur_memory():
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    stats = torch.cuda.memory_stats()
+    peak_bytes_requirement = stats["allocated_bytes.all.current"]/(1024**3)
+    return peak_bytes_requirement
+
+
+def memory_experiment(args, model_iter_fn, model, example_inputs):
+    """
+    Measure memory footprint.
+    Writes to ./memory.csv
+    """
+    gc.collect()
+    torch.cuda.empty_cache()
+    model_iter_fn(model, example_inputs)
+    baseline_memory = get_cur_memory()
+    
+    with torchdynamo.run():
+        gc.collect()
+        torch.cuda.empty_cache()
+        model_iter_fn(model, example_inputs)
+        opt_memory = get_cur_memory()
+
+    cr = baseline_memory/opt_memory
+    output_csv(
+        output_filename,
+        ("dev", "name", "basline", "opt", "cr"), [current_device, current_name, baseline_memory, opt_memory, float(cr)]
+    )
+    return cr
 
 
 def speedup_experiment(args, model_iter_fn, model, example_inputs):
@@ -244,6 +293,7 @@ def speedup_experiment(args, model_iter_fn, model, example_inputs):
     median = np.median(timings, axis=0)
     speedup = median[0] / median[1]
     output_csv(
+        output_filename,
         ("dev", "name", "speedup"), [current_device, current_name, float(speedup)]
     )
     return format_speedup(speedup, pvalue)
@@ -298,6 +348,7 @@ def baselines(models, model_iter_fn, example_inputs, args):
         ]
     )
     output_csv(
+        output_filename,
         ("dev", "name") + tuple(n for n, m in models[1:]),
         [current_device, current_name] + [f"{x:.4f}" for x in speedup],
     )
@@ -321,10 +372,10 @@ def speedup_experiment_ts(args, model_iter_fn, model, example_inputs):
         [
             ("eager", model),
             ("ts", try_script(model, example_inputs)),
-            (
-                "ofi",
-                backends.ofi(try_script(model, example_inputs), example_inputs),
-            ),
+            # (
+            #     "ofi",
+            #     backends.ofi(try_script(model, example_inputs), example_inputs),
+            # ),
             # ("nnc", backends.nnc(try_script(model, example_inputs), example_inputs)),
             # ("nvfuser", backends.nvfuser(try_script(model, example_inputs), example_inputs)),
         ],
@@ -504,6 +555,11 @@ def main():
         action="store_true",
         help="sets model.eval() to reduce randomness",
     )
+    parser.add_argument(
+        "--memory",
+        action="store_true",
+        help="measure memory footprint",
+    )
 
     group = parser.add_mutually_exclusive_group()
     group.add_argument(
@@ -553,12 +609,22 @@ def main():
     group.add_argument(
         "--accuracy-aot-nop",
         action="store_true",
-        help="Accuracy testing for AOT vs Eager",
+        help="Accuracy testing and speedup for AOT vs Eager",
     )
     group.add_argument(
-        "--speedup-aot-efficient-fusion",
+        "--accuracy-aot-ts",
         action="store_true",
-        help="speedup using experimental fixed_strategy backend",
+        help="Accuracy testing and speedup for AOT with Torchscript(NNC/NVFuser) vs Eager",
+    )
+    group.add_argument(
+        "--accuracy-aot-ts-mincut",
+        action="store_true",
+        help="Accuracy testing and speedup for AOT with Torchscript(NNC/NVFuser) with mincut vs Eager",
+    )
+    group.add_argument(
+        "--accuracy-ts",
+        action="store_true",
+        help="Accuracy testing and speedup using Torchscript (NNC/NVFuser) vs eager",
     )
     group.add_argument("--nothing", action="store_true", help=help(null_experiment))
     group.add_argument(
@@ -688,15 +754,46 @@ def main():
         )
         experiment = speedup_experiment
         output_filename = "accuracy_aot_nop.csv"
+        if args.memory:
+            experiment = memory_experiment
+            output_filename = "accuracy_aot_nop_memory.csv"
         args.check_accuracy = True
         args.isolate = True
-    elif args.speedup_aot_efficient_fusion:
+    elif args.accuracy_aot_ts:
+        optimize_ctx = torchdynamo.optimize(
+            aot_autograd_nnc_strategy, nopython=args.nopython
+        )
+        experiment = speedup_experiment
+        backend_str = "nvfuser" if args.nvfuser else "nnc"
+        output_filename = f"accuracy_aot_{backend_str}.csv"
+        if args.memory:
+            experiment = memory_experiment
+            output_filename = f"accuracy_aot_{backend_str}_memory.csv"
+        args.check_accuracy = True
+        args.isolate = True
+    elif args.accuracy_aot_ts_mincut:
         optimize_ctx = torchdynamo.optimize(
             aot_autograd_speedup_strategy, nopython=args.nopython
         )
         experiment = speedup_experiment
-        output_filename = "speedups_aot_efficient_fusion.csv"
-        args.check_accuracy = False
+        backend_str = "nvfuser" if args.nvfuser else "nnc"
+        output_filename = f"accuracy_aot_{backend_str}_mincut.csv"
+        if args.memory:
+            experiment = memory_experiment
+            output_filename = f"accuracy_aot_{backend_str}_mincut_memory.csv"
+        args.check_accuracy = True
+        args.isolate = True
+    elif args.accuracy_ts:
+        optimize_ctx = torchdynamo.optimize(
+            lambda x, _: torch.jit.script(x), nopython=args.nopython
+        )
+        experiment = speedup_experiment
+        backend_str = "nvfuser" if args.nvfuser else "nnc"
+        output_filename = f"accuracy_{backend_str}.csv"
+        if args.memory:
+            experiment = memory_experiment
+            output_filename = f"accuracy_{backend_str}_memory.csv"
+        args.check_accuracy = True
         args.isolate = True
     elif args.nothing:
         pass
@@ -734,6 +831,11 @@ def main():
                 optimize_ctx,
                 experiment,
             )
+        stats_file = output_filename.split(".csv")[0] + "_stats.csv"
+        output_csv(
+            stats_file,
+            ("dev", "name", "total_aot_graphs", "ok_aot_graphs"), [current_device, current_name, *Stats.aot_summary()]
+        )
     elif args.isolate:
         if output_filename and os.path.exists(output_filename):
             os.unlink(output_filename)
@@ -744,7 +846,7 @@ def main():
             except subprocess.SubprocessError:
                 print("ERROR")
                 for device in args.devices:
-                    output_csv([], [device, name, 0.0])
+                    output_csv(output_filename, [], [device, name, 0.0])
         print_summary(output_filename)
     else:
         os.path.exists(output_filename) and os.unlink(output_filename)
@@ -823,6 +925,8 @@ def run_one_model(
         elif not same(correct_result, new_result):
             print("INCORRECT")
             return sys.exit(-1)
+        # print("CORRECT")
+        # return sys.exit(-1)
         ok, total = Stats.reset_counters()
         results = []
 

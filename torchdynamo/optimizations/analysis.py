@@ -36,27 +36,33 @@ class ShapeAliasingAndMutationProp(ShapeProp):
         args, kwargs = self.fetch_args_kwargs_from_env(n)
         tensor_args = self.extract_tensors((args, kwargs))
 
-        versions1 = [obj._version for obj in tensor_args]
+        input_versions1 = [obj._version for obj in tensor_args]
         result = getattr(self, n.op)(n.target, args, kwargs)
-        versions2 = [obj._version for obj in tensor_args]
-
-        input_alias_groups = set()
-
-        def visit_arg(arg: torch.fx.Node):
-            input_alias_groups.update(arg.meta["alias_groups"])
-
-        torch.fx.map_arg((n.args, n.kwargs), visit_arg)
+        input_versions2 = [obj._version for obj in tensor_args]
 
         n.meta["type"] = type(result)
         n.meta["alias_groups"] = {
             self.tensor_alias_group(obj) for obj in self.extract_tensors(result)
         }
-        n.meta["input_alias_groups"] = input_alias_groups
         n.meta["mutates_alias_groups"] = {
             self.tensor_alias_group(tensor)
-            for tensor, v1, v2 in zip(tensor_args, versions1, versions2)
+            for tensor, v1, v2 in zip(tensor_args, input_versions1, input_versions2)
             if v1 != v2
         }
+        n.meta["indirect_mutation"] = False
+
+        import operator
+        def visit_arg(arg: torch.fx.Node):
+            if (arg.op == "call_function" and arg.target == operator.getitem) or arg.meta['indirect_mutation']:
+                if bool(n.meta["mutates_alias_groups"] & arg.meta["alias_groups"]):
+                    n.meta["indirect_mutation"] = True
+        torch.fx.map_arg((n.args, n.kwargs), visit_arg)
+        # if n.op == "call_function" and n.target == operator.getitem:
+        #     n.meta["mutates_alias_groups"] = {
+        #         self.tensor_alias_group(tensor)
+        #         for tensor, v1, v2 in zip(tensor_args, input_versions1, input_versions2)
+        #     }
+
         n.meta["is_input_alias"] = bool(
             self.input_alias_groups & n.meta["alias_groups"]
         )
@@ -71,6 +77,25 @@ class ShapeAliasingAndMutationProp(ShapeProp):
         if tensors:
             n.meta["device"] = tensors[0].device
             n.meta["dtype"] = tensors[0].dtype
+
+        if True or n.meta['is_mutation'] or n.meta['is_input_mutation'] or n.meta["is_input_alias"]:
+            print("----------------------")
+            print(n, n.args, n.kwargs, n.op, n.target)
+            print(n, "alias_groups", n.meta["alias_groups"])
+            print(n, "mutates_alias_groups", n.meta["mutates_alias_groups"])
+            print(n, "is_input_alias", n.meta["is_input_alias"])
+            print(n, "is_input_mutation", n.meta["is_input_mutation"])
+            print(n, "is_mutation", n.meta["is_mutation"])
+ 
+        if n.meta['is_input_mutation'] and n.meta["is_input_alias"]:
+            # This means the one of the output and input are aliased
+            # and that the aliased input is also the 
+            inputs_mutated_by_op = self.input_alias_groups & n.meta["mutates_alias_groups"]
+            inputs_mutated_by_output = self.input_alias_groups & n.meta["alias_groups"]
+            if inputs_mutated_by_op == inputs_mutated_by_output:
+                input_proxy = [idx for idx, x in enumerate(tensor_args) if self.tensor_alias_group(x) in inputs_mutated_by_op]
+                output_proxy = [idx for idx, x in enumerate(tensors) if self.tensor_alias_group(x) in inputs_mutated_by_op]
+                n.meta['input_output_idx_alias_group'] = [input_proxy, output_proxy]
         return result
 
     @staticmethod
@@ -90,23 +115,26 @@ class ShapeAliasingAndMutationProp(ShapeProp):
     def tag_indirect_mutation(self):
         checks = collections.defaultdict(set)
         for n in self.module.graph.nodes:
+            print("Wokring on ", n)
 
             def visit_arg(arg: torch.fx.Node):
                 for group in arg.meta["alias_groups"]:
                     if group in checks:
                         for other_node in checks[group]:
                             if other_node is not arg:
-                                other_node.meta["indirect_mutation"] = True
+                                print("Indirect", arg, other_node)
+                                # other_node.meta["indirect_mutation"] = True
 
             torch.fx.map_arg((n.args, n.kwargs), visit_arg)
             n.meta["indirect_mutation"] = False
             for group in n.meta["mutates_alias_groups"]:
+                print("Adding to", n)
                 checks[group].add(n)
 
     def run(self, *args):
         try:
             super().run(*args)
-            self.tag_indirect_mutation()
+            # self.tag_indirect_mutation()
         finally:
             # cleanup
             self.storage_keepalive.clear()
@@ -121,5 +149,9 @@ def has_mutation(gm, example_inputs):
 
     for node in new_gm.graph.nodes:
         if node.meta["is_mutation"] or node.meta["is_input_mutation"]:
+            print("Mutation failed", gm, node, node.meta)
+            # if first and node.meta["is_input_mutation"]:
+            #     print(gm)
+            #     first = False
             return True
     return False

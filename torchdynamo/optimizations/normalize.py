@@ -315,6 +315,25 @@ class Inplacifier:
             torch.fx.map_arg((node.args, node.kwargs), record_usage)
 
 
+class RemoveDropout(Transformer):
+    """
+    Removes dropout layer if the training arg is False. This is part of
+    normalizing the operators. This removes the corner cases in aliasing
+    surrounding eval dropout operations.
+    """
+    def __init__(self, *args, **kwargs):
+        super(RemoveDropout, self).__init__(*args, **kwargs)
+    
+    def run_node(self, n: torch.fx.Node):
+        args, kwargs = self.fetch_args_kwargs_from_env(n)
+        kwargs = dict(kwargs)        
+        if n.op == "call_function" and n.target == torch.nn.functional.dropout and not kwargs["training"]:
+            result = args[0]
+        else:
+            result = getattr(self, n.op)(n.target, args, kwargs)
+        return result
+
+
 class Functionalization(Transformer):
     """
     Remove most cases of mutation from a given fx Graph.
@@ -323,6 +342,7 @@ class Functionalization(Transformer):
     def __init__(self, *args, **kwargs):
         super(Functionalization, self).__init__(*args, **kwargs)
         self.tracer.tensor_attrs = dict()  # TODO(jansel): upstream this fix
+        self.mutated_inputs = {}
 
     def run_node(self, n: torch.fx.Node):
 
@@ -330,6 +350,8 @@ class Functionalization(Transformer):
         target = n.target
         args, kwargs = self.fetch_args_kwargs_from_env(n)
         kwargs = dict(kwargs)
+        input_idx = output_idx = None
+        save_me = False
 
         if (
             not n.meta["is_input_mutation"]
@@ -351,6 +373,26 @@ class Functionalization(Transformer):
 
             if target in OPERATOR_REPLACEMENTS and not kwargs:
                 target = OPERATOR_REPLACEMENTS[target]
+        # else:
+        #     print("Misesed", n, n.meta)
+
+        #     print(n.meta["is_input_mutation"])
+        #     print(not n.meta["indirect_mutation"])
+        #     print(issubclass(n.meta["type"], torch.Tensor))
+        # elif (
+        #     n.meta["is_input_mutation"]
+        #     and n.meta["is_input_alias"]
+        #     and not n.meta["indirect_mutation"]
+        #     and issubclass(n.meta["type"], torch.Tensor)
+        # ):
+        #     print("++++++++++++++++++++")
+        #     input_idx, output_idx = n.meta['input_output_idx_alias_group']
+        #     input_idx = input_idx[0]
+        #     output_idx = output_idx[0]
+        #     if n.target in IOPERATOR_REPLACEMENTS:
+        #         target = IOPERATOR_REPLACEMENTS[n.target]
+        #         patches.append(n.args[0])
+        #     save_me = True
 
         if target is builtins.getattr:
             if args[1] == "dtype":
@@ -369,6 +411,23 @@ class Functionalization(Transformer):
             counters["nontensor"][long_name(self.module, n)] += 1
 
         result = getattr(self, n.op)(target, args, kwargs)
+
+        # if save_me:
+        #     if isinstance(result, (list, tuple)):
+        #         self.mutated_inputs[input_idx] = result[output_idx]
+        #     else:
+        #         self.mutated_inputs[input_idx] = result
+        #         
+
+        # if n.op == "output":
+        #     result = list(result)
+        #     for i in self.mutated_inputs.values():
+        #         result.append(i)
+        #     
+        #     result = tuple(result)
+        #     # print(self.mutated_inputs)
+        #     # self.env[n] = [self.mutated_inputs.values()]
+        #     # print(self.env[n])
 
         for patch in patches:
             assert isinstance(
@@ -418,8 +477,11 @@ def normalize_ir(gm, example_inputs):
         example_inputs = clone_inputs(example_inputs)
         normalize(gm)
         gm = NormalizeOperators(gm).transform()
+        gm = RemoveDropout(gm).transform()
         ShapeAliasingAndMutationProp(gm).run(*example_inputs)
+        # print("Before", gm)
         gm = Functionalization(gm).transform()
     gm.recompile()
+    # print("After", gm)
     # record_graph_stats(gm)
     return gm
