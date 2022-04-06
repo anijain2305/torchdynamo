@@ -119,7 +119,7 @@ def jit_trace(gm, example_inputs):
 
 def same(left, right):
     return len(left) == len(right) and all(
-        torch.allclose(a, b, atol=1e-4, rtol=1e-4) for a, b in zip(left, right)
+        torch.allclose(a, b, atol=1e-3, rtol=1e-3) for a, b in zip(left, right)
     )
 
 
@@ -138,7 +138,8 @@ class TorchScriptStrategy(object):
         self.original_example_inputs = example_inputs
         self.correct = gm.forward(*self.example_inputs)
         self.gm = normalize_ir(gm, self.original_example_inputs)
-        self.scripted = jit_trace(self.gm, self.example_inputs)
+        # self.scripted = jit_trace(self.gm, self.example_inputs)
+        self.scripted = torch.jit.script(self.gm)
 
     @property
     def example_inputs(self):

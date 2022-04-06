@@ -91,7 +91,7 @@ def same(a, b, cos_similarity=False):
             print(f"Similarity score={res.cpu().numpy()}")
             return res >= 0.99
         else:
-            return torch.allclose(a, b, atol=1e-4, rtol=1e-4)
+            return torch.allclose(a, b, atol=1e-3, rtol=1e-3)
     elif isinstance(a, (str, int, float, type(None), bool, torch.device)):
         return a == b
     elif type(a).__name__ in (

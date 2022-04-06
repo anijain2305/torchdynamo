@@ -120,6 +120,7 @@ DONT_EXPAND_MODULES = {
     "ConvReLU2d",
     "ConvBn2d",
     "ConvBnReLU2d",
+    "DistributedDataParallel",
     "EmbeddingBag",
     "InstanceNorm2d",
     "LSTM",
@@ -430,5 +431,35 @@ def normalize_ir(gm, example_inputs):
         ShapeAliasingAndMutationProp(gm).run(*example_inputs)
         gm = Functionalization(gm).transform()
     gm.recompile()
+
+    for node in gm.graph.nodes:
+        new_kwargs = {}
+        for k, v in node.kwargs.items():
+            if isinstance(v, torch.device):
+                v = v.type
+            new_kwargs[k] = v
+        node.kwargs = new_kwargs
+        new_args = list(node.args)
+        for idx, arg in enumerate(node.args):
+            if isinstance(arg, torch.device):
+                arg = arg.type
+                new_args[idx] = arg
+        node.args = tuple(new_args)
+ 
+    for node in gm.graph.nodes:
+        if node.target is torch.nn.functional._pad:
+            new_kwargs = dict(node.kwargs)
+            if "value" in node.kwargs and isinstance(node.kwargs["value"], int):
+                new_kwargs["value"] = float(node.kwargs["value"])
+            node.kwargs = new_kwargs
+        elif node.target in ("masked_fill_", "masked_fill") and node.args[2] == float("-inf"):
+            args = list(node.args)
+            args[2] = -3.403 * 10**37
+            node.args = tuple(args)
+        elif node.target == torch._C._set_grad_enabled:
+            gm.graph.erase_node(node)
+
+    gm.recompile()
+
     # record_graph_stats(gm)
     return gm
